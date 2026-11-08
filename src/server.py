@@ -7791,7 +7791,90 @@ def _timeline_bulk_set_item_properties(tl, p: Dict[str, Any]) -> Dict[str, Any]:
     return {"success": all(row.get("success") for row in results), "results": results, "op_count": len(ops)}
 
 
+def _set_cdl_outcome(item, normalized, preflight) -> Dict[str, Any]:
+    """One SetCDL call reported as {set_cdl, diagnosis?|error?}."""
+    try:
+        applied = bool(item.SetCDL(normalized))
+    except Exception as exc:
+        return {"set_cdl": False, "error": str(exc)}
+    if not applied:
+        return {"set_cdl": False, "diagnosis": _cdl_failure_diagnosis(item, preflight)}
+    return {"set_cdl": True}
+
+
+_ITEM_CDLS_EXCLUSIVE_KEYS = ("target_ids", "timeline_item_ids", "cdl", "copy_from_item_id", "source_item_id")
+
+
+def _timeline_apply_item_cdls(tl, p: Dict[str, Any]) -> Dict[str, Any]:
+    """Per-item CDLs in one call. Every entry passes validation, ID resolution and
+    node preflight before any write; writes are not transactional, so a runtime
+    failure leaves earlier items graded and the batch is safe to re-run."""
+    conflicts = [key for key in _ITEM_CDLS_EXCLUSIVE_KEYS if p.get(key) is not None]
+    if conflicts:
+        return _err(f"item_cdls cannot be combined with {', '.join(conflicts)}",
+                    code="INVALID_PARAMS", category="invalid_input")
+    item_cdls = p.get("item_cdls")
+    if not isinstance(item_cdls, list) or not item_cdls:
+        return _err("item_cdls must be a non-empty list of {timeline_item_id, cdl} objects",
+                    code="INVALID_PARAMS", category="invalid_input")
+    ids: List[str] = []
+    for index, entry in enumerate(item_cdls):
+        if not isinstance(entry, dict) or not entry.get("timeline_item_id"):
+            return _err(f"item_cdls[{index}] must be an object with timeline_item_id and cdl",
+                        code="INVALID_PARAMS", category="invalid_input")
+        ids.append(str(entry["timeline_item_id"]))
+    duplicates = sorted({item_id for item_id in ids if ids.count(item_id) > 1})
+    if duplicates:
+        return _err(f"item_cdls has duplicate timeline_item_id: {', '.join(duplicates)}",
+                    code="INVALID_PARAMS", category="invalid_input")
+    dry_run = _coerce_bool(p.get("dry_run"), False)
+
+    validations = []
+    for item_id, entry in zip(ids, item_cdls):
+        validation, err = _validate_cdl_payload(entry.get("cdl"))
+        if err:
+            validation = {"valid": False, "errors": [err["error"]["message"]], "cdl": None}
+        validations.append({"timeline_item_id": item_id, **validation})
+    targets, missing = _timeline_items_by_ids_report(tl, ids, track_types=("video",))
+    items_by_id = {_safe_timeline_item_id(item): item for item in targets}
+    preflights = []
+    plan = []
+    for validation in validations:
+        item = items_by_id.get(validation["timeline_item_id"])
+        if item is None or not validation["valid"]:
+            continue
+        node_ok, preflight = _cdl_node_preflight(item, validation["cdl"]["NodeIndex"])
+        preflights.append({"timeline_item_id": validation["timeline_item_id"], **preflight})
+        if node_ok:
+            plan.append((item, validation, preflight))
+
+    out: Dict[str, Any] = {
+        "targets": [_timeline_item_summary(item) for item in targets],
+        "missing": missing,
+        "dry_run": dry_run,
+        "validation": validations,
+        "node_preflight": preflights,
+    }
+    if dry_run or len(plan) != len(ids):
+        out["success"] = len(plan) == len(ids)
+        return out
+
+    results = []
+    for item, validation, preflight in plan:
+        row = {"timeline_item_id": validation["timeline_item_id"]}
+        row.update(_set_cdl_outcome(item, _normalize_cdl(validation["cdl"]), preflight))
+        results.append(row)
+    out["cdl_results"] = results
+    applied = sum(1 for row in results if row["set_cdl"])
+    out["success"] = applied == len(results)
+    if 0 < applied < len(results):
+        out["partial"] = True
+    return out
+
+
 def _timeline_apply_look_to_items(tl, p: Dict[str, Any]) -> Dict[str, Any]:
+    if p.get("item_cdls") is not None:
+        return _timeline_apply_item_cdls(tl, p)
     target_ids = p.get("target_ids") or p.get("timeline_item_ids") or []
     if not isinstance(target_ids, list) or not target_ids:
         return _err("apply_look_to_items requires target_ids: non-empty list of video timeline item IDs")
@@ -7848,13 +7931,7 @@ def _timeline_apply_look_to_items(tl, p: Dict[str, Any]) -> Dict[str, Any]:
                             "node_preflight": preflight})
                 results.append(row)
                 continue
-            try:
-                row["set_cdl"] = bool(item.SetCDL(normalized))
-                if not row["set_cdl"]:
-                    row["diagnosis"] = _cdl_failure_diagnosis(item, preflight)
-            except Exception as exc:
-                row["set_cdl"] = False
-                row["error"] = str(exc)
+            row.update(_set_cdl_outcome(item, normalized, preflight))
             results.append(row)
     out["cdl_results"] = results
     if source_item is not None:
@@ -27724,6 +27801,10 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         the triage shape (paint N clips in one call).
         # example: action_help(name='<action_name>')
       apply_look_to_items(target_ids, cdl?|copy_from_item_id?, dry_run?) -> {success}
+      apply_look_to_items(item_cdls=[{timeline_item_id, cdl}], dry_run?) -> {success, cdl_results, partial?}
+        per-item CDLs; all entries are validated, resolved and node-preflighted before
+        any write. Writes are not transactional: on partial, re-run the same batch
+        (SetCDL sets absolute values, so a re-run converges).
         # example: action_help(name='<action_name>')
       thumbnail_contact_sheet(frames?|max_samples?, analysis_root?) -> {path, samples}
         frames are relative to the timeline start (frame 0 = first frame), like marker frameIds.
@@ -30705,9 +30786,17 @@ _ACTION_HELP: Dict[str, Dict[str, Dict[str, Any]]] = {
             ),
         },
         "apply_look_to_items": {
-            "summary": "Apply one CDL or copied grade to many items.",
-            "params": "target_ids: [str], cdl?|copy_from_item_id?, dry_run?",
-            "returns": "{targets, missing, dry_run, cdl_results?, copy_grades?, success}",
+            "summary": "Apply one CDL or copied grade to many items, or a different CDL per item via item_cdls.",
+            "params": (
+                "target_ids: [str], cdl?|copy_from_item_id?, dry_run? — OR — "
+                "item_cdls: [{timeline_item_id, cdl}], dry_run? (exclusive with target_ids/cdl/copy_from_item_id; "
+                "every entry is validated, resolved and node-preflighted before any write; writes are not "
+                "transactional — on partial, re-run the same batch: SetCDL sets absolute values, so it converges)"
+            ),
+            "returns": (
+                "{targets, missing, dry_run, cdl_results?, copy_grades?, success}; "
+                "item_cdls adds validation, node_preflight and partial? (some writes succeeded, some failed)"
+            ),
             "example": (
                 'timeline(action="apply_look_to_items", params={\n'
                 '  "target_ids": ["TimelineItem-1", "TimelineItem-2", "TimelineItem-3"],\n'
