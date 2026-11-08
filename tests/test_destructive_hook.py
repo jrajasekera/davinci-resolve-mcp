@@ -730,6 +730,76 @@ class AutoRunIdleTimeoutPreferenceTest(unittest.TestCase):
         self.assertEqual(seen["timeout"], 90.0)
 
 
+class AutoArchivePreferenceTest(unittest.TestCase):
+    """`timeline_versioning_auto_archive` turns off version-on-mutate for
+    non-strict calls only; strict calls always archive."""
+
+    KEY = "timeline_versioning_auto_archive"
+
+    def setUp(self) -> None:
+        self._orig_pref_provider = destructive_hook._PREFERENCE_PROVIDER
+        self.addCleanup(
+            setattr, destructive_hook, "_PREFERENCE_PROVIDER", self._orig_pref_provider
+        )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        ctx = mock.patch.object(
+            destructive_hook,
+            "_resolve_versioning_context",
+            return_value=(mock.Mock(), mock.Mock(), self.tmp.name, "proj"),
+        )
+        ctx.start()
+        self.addCleanup(ctx.stop)
+        run = mock.patch.object(
+            destructive_hook, "_extract_analysis_run_id", return_value="run-1"
+        )
+        run.start()
+        self.addCleanup(run.stop)
+        self.ensure = mock.patch.object(
+            destructive_hook.timeline_versioning,
+            "ensure_versioned_before_mutation",
+            return_value={"archived": True},
+        ).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _call(self, params):
+        @destructive_hook.destructive_op("timeline_item")
+        def fake_item(action: str, params=None):
+            return {"success": True, "called_through": True}
+
+        return fake_item("set_clip_enabled", params)
+
+    def test_auto_archive_disabled_by_preference(self) -> None:
+        destructive_hook.register_preference_provider(
+            lambda key: False if key == self.KEY else None
+        )
+        result = self._call({"clip_id": "x", "enabled": False})
+        self.ensure.assert_not_called()
+        self.assertTrue(result["called_through"])
+        self.assertFalse(result["_versioning"]["archived"])
+        self.assertEqual(result["_versioning"]["skipped_reason"], "disabled_by_preference")
+
+    def test_strict_action_archives_despite_preference(self) -> None:
+        destructive_hook.register_preference_provider(
+            lambda key: False if key == self.KEY else None
+        )
+        self._call({"clip_id": "x", "enabled": False, "strict": True})
+        self.ensure.assert_called_once()
+
+    def test_auto_archive_defaults_on_without_preference(self) -> None:
+        destructive_hook.register_preference_provider(lambda key: None)
+        self._call({"clip_id": "x", "enabled": False})
+        self.ensure.assert_called_once()
+
+    def test_auto_archive_defaults_on_when_provider_raises(self) -> None:
+        def boom(key):
+            raise RuntimeError("prefs unreadable")
+
+        destructive_hook.register_preference_provider(boom)
+        self._call({"clip_id": "x", "enabled": False})
+        self.ensure.assert_called_once()
+
+
 class SecurityAuditLogIsolation(unittest.TestCase):
     """The suite must not write into the operator's real audit trail.
 

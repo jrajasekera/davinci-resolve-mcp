@@ -4,7 +4,9 @@ Wraps each top-level compound tool function in `src/server.py` so that any
 destructive sub-action automatically:
 
 1. Resolves the project root via the configured project-root provider.
-2. Calls `timeline_versioning.ensure_versioned_before_mutation()` for the run.
+2. Calls `timeline_versioning.ensure_versioned_before_mutation()` for the run
+   (non-strict calls skip it when preference `timeline_versioning_auto_archive`
+   is false; strict calls always archive).
 3. Captures the declared metric's `before_value` (if `metric` was passed in params).
 4. Runs the original handler.
 5. Captures the declared metric's `after_value` (and gap stats by default).
@@ -1435,16 +1437,26 @@ def destructive_op(tool_name: str) -> Callable[[Callable[..., Any]], Callable[..
             auto_save = bool(_read_preference(
                 "timeline_versioning_auto_save_after_archive", False,
             ))
+            # Preference can turn archiving off, but never for strict calls.
+            archive_enabled = strict or _coerce_bool(
+                _read_preference("timeline_versioning_auto_archive", True), True,
+            )
             try:
-                archive_result = timeline_versioning.ensure_versioned_before_mutation(
-                    resolve=resolve_h,
-                    project=project_h,
-                    project_root=project_root,
-                    analysis_run_id=run_id,
-                    reason=f"{tool_name}.{action}",
-                    initiator=initiator,
-                    auto_save=auto_save,
-                )
+                if archive_enabled:
+                    archive_result = timeline_versioning.ensure_versioned_before_mutation(
+                        resolve=resolve_h,
+                        project=project_h,
+                        project_root=project_root,
+                        analysis_run_id=run_id,
+                        reason=f"{tool_name}.{action}",
+                        initiator=initiator,
+                        auto_save=auto_save,
+                    )
+                else:
+                    archive_result = {
+                        "archived": False,
+                        "skipped_reason": "disabled_by_preference",
+                    }
             except Exception as exc:
                 archive_exc = exc
                 logger.warning(
@@ -1553,6 +1565,7 @@ def destructive_op(tool_name: str) -> Callable[[Callable[..., Any]], Callable[..
                     "analysis_run_id": run_id,
                     "archived": archive_result.get("archived"),
                     "archived_version": archive_result.get("version"),
+                    "skipped_reason": archive_result.get("skipped_reason"),
                     "metric": metric,
                     "before_value": before_value,
                     "after_value": after_value,
