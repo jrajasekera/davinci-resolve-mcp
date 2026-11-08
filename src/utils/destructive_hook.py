@@ -845,6 +845,24 @@ TRAP_REFUSAL_EXEMPT_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
     ("timeline_item_color", "bulk_match_to_hero"),
 })
 
+#: Actions whose symbol-level trap fires only on some param paths. The ACTION_SYMBOLS
+#: map is per (tool, action), but `timeline.apply_look_to_items` calls CopyGrades
+#: only when copying from a source item; its `item_cdls` and `cdl` paths call just
+#: SetCDL. Refusing those would make callers acknowledge every CDL call, which
+#: teaches them to always acknowledge and defeats the guard where it matters.
+#: The refusal applies only when at least one listed param is truthy; the advisory
+#: `known_limitation` still attaches either way.
+TRAP_CONDITIONAL_PARAMS: Dict[Tuple[str, str], Tuple[str, ...]] = {
+    ("timeline", "apply_look_to_items"): ("copy_from_item_id", "source_item_id"),
+}
+
+
+def _trap_applies(tool_name: str, action: str, params: Optional[Dict[str, Any]]) -> bool:
+    needed = TRAP_CONDITIONAL_PARAMS.get((tool_name, action))
+    if needed is None:
+        return True
+    return isinstance(params, dict) and any(params.get(k) for k in needed)
+
 
 def _trap_acknowledged(params: Optional[Dict[str, Any]]) -> bool:
     """Did the caller explicitly accept a known-destructive behaviour?"""
@@ -1594,6 +1612,7 @@ def destructive_op(tool_name: str) -> Callable[[Callable[..., Any]], Callable[..
                 if (
                     blocking
                     and (tool_name, action) not in TRAP_REFUSAL_EXEMPT_ACTIONS
+                    and _trap_applies(tool_name, action, params)
                     and not _trap_acknowledged(params)
                     and not _explicit_dry_run_requested(params)
                 ):

@@ -247,6 +247,44 @@ class GuardBehaviour(unittest.TestCase):
         self.assertEqual(calls, ["bulk_match_to_hero"])
         self.assertNotIn("retry_with", out)
 
+    def _timeline_tool(self):
+        calls = []
+
+        @dh.destructive_op("timeline")
+        def timeline(action, params=None, *a, **k):
+            calls.append(action)
+            return {"success": True}
+
+        return timeline, calls
+
+    def test_item_cdls_not_refused_by_copy_grades_trap(self):
+        tool, calls = self._timeline_tool()
+        out = tool("apply_look_to_items", {"item_cdls": [{"item_id": "a", "cdl": {}}]})
+        self.assertEqual(calls, ["apply_look_to_items"])
+        self.assertNotIn("retry_with", out)
+
+    def test_cdl_only_target_ids_not_refused_by_copy_grades_trap(self):
+        tool, calls = self._timeline_tool()
+        out = tool("apply_look_to_items", {"target_ids": ["a"], "cdl": {"slope": [1, 1, 1]}})
+        self.assertEqual(calls, ["apply_look_to_items"])
+        self.assertNotIn("retry_with", out)
+        self.assertEqual(out["known_limitation"][0]["symbol"], "TimelineItem.CopyGrades")
+
+    def test_copy_from_still_refused_without_acknowledge(self):
+        for key in ("copy_from_item_id", "source_item_id"):
+            with self.subTest(key=key):
+                tool, calls = self._timeline_tool()
+                out = tool("apply_look_to_items", {"target_ids": ["a"], key: "src"})
+                self.assertEqual(calls, [])
+                self.assertEqual(out["retry_with"], {"acknowledge_trap": True})
+
+    def test_copy_from_with_acknowledge_runs(self):
+        tool, calls = self._timeline_tool()
+        tool("apply_look_to_items", {
+            "target_ids": ["a"], "copy_from_item_id": "src", "acknowledge_trap": True,
+        })
+        self.assertEqual(calls, ["apply_look_to_items"])
+
     def test_unmapped_action_is_untouched(self):
         tool, calls = self._tool()
         out = tool("set_cdl", {})
