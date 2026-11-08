@@ -479,6 +479,44 @@ class BridgeProxy:
                 )
         return _BoundMethod(self._transport, self._handle, name)
 
+    # -- subscript ---------------------------------------------------------
+    #
+    # Fusion reaches inputs by subscript (`tool["Size"]`, and
+    # `tool["Size"][time] = value` for a keyframe). Implicit dunder lookup goes
+    # to the class, never through `__getattr__`, so these have to be real
+    # methods — and `call` refuses `_`-prefixed names, so they use their own
+    # bridge operations rather than forwarding `__getitem__` as a method.
+
+    #: `__getitem__` alone opts a class into the legacy sequence protocol:
+    #: `iter(proxy)` and `x in proxy` would call get_item(0), get_item(1), ...
+    #: until IndexError, and a Fusion object answers None forever — an endless
+    #: bridge loop where there used to be a clean TypeError.
+    __iter__ = None
+
+    def _subscript(self, operation: str, arguments: Dict[str, Any]) -> Any:
+        try:
+            return self._transport.request(operation, {"target": self._handle, **arguments}) or {}
+        except BridgeCallError as exc:
+            if exc.code != "operation_not_allowed":
+                raise
+            # The in-Resolve runtime is a copy taken at install time, so an old
+            # one simply lacks these routes. Name the fix rather than surfacing
+            # a bare refusal from deep inside a Fusion tool.
+            raise TypeError(
+                "The running in-Resolve bridge is older than this client and cannot "
+                "subscript Fusion objects. Re-run `python scripts/install_resolve_bridge.py`, "
+                "then reload the bridge (bridge_reload() from Python, or stop and "
+                "restart Workspace > Scripts > resolve_bridge in Resolve)."
+            ) from exc
+
+    def __getitem__(self, key: Any) -> Any:
+        result = self._subscript("get_item", {"key": key})
+        self._transport.note_truncation(f"[{key!r}]", result.get("truncated"))
+        return _decode_value(self._transport, result.get("value"))
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self._subscript("set_item", {"key": key, "value": _encode_argument(value)})
+
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<BridgeProxy {self._handle}>"
 

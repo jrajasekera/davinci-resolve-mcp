@@ -2414,6 +2414,141 @@ class AttributeReadingTests(unittest.TestCase):
         self.assertTrue(rbo.ResolveOperations.PROXY_OPERATIONS)
 
 
+class SubscriptTests(unittest.TestCase):
+    """Fusion inputs are reached by subscript, which a method proxy cannot carry.
+
+    `fusion_comp` add_keyframe / bulk_set_expressions / add_modifier do
+    `tool["Size"]` and `tool["Size"][time] = value`. Over the bridge that died
+    with "'BridgeProxy' object is not subscriptable", and `call` cannot stand
+    in because it refuses every `_`-prefixed name, `__getitem__` included.
+    """
+
+    class FakeInput:
+        """A Fusion Input: subscript assignment sets a keyframe."""
+
+        def __init__(self):
+            self.keys = {}
+            self.expressions = []
+
+        def SetExpression(self, expr, t):
+            self.expressions.append((expr, t))
+
+        def __setitem__(self, t, v):
+            self.keys[t] = v
+
+    class FakeTool:
+        """A Fusion Tool: subscript reads return an Input, or None when absent."""
+
+        def __init__(self, fake_input):
+            self.fake_input = fake_input
+            self.assigned = {}
+
+        def ConnectInput(self, *a):
+            return True
+
+        def __getitem__(self, name):
+            if name == "Boom":
+                raise RuntimeError("Fusion refused")
+            return self.fake_input if name == "Size" else None
+
+        def __setitem__(self, name, value):
+            self.assigned[name] = value
+
+    def setUp(self) -> None:
+        self.fake_input = self.FakeInput()
+        self.fake_tool = self.FakeTool(self.fake_input)
+
+    def _serve(self, target, operations=None):
+        import tempfile
+        from src.utils import resolve_bridge_client as rbc
+        from src.utils import resolve_bridge_ops as rbo
+
+        root = tempfile.mkdtemp(prefix="subscript_")
+        ops = (operations or rbo.ResolveOperations)(target, media_roots=[root], output_roots=[root])
+        config = {"host": "127.0.0.1", "port": 0, "token": TOKEN, "auth_clock_skew_seconds": 60}
+        bridge = rb.Bridge(target, config, rbo.make_dispatch(ops))
+        bridge.start()
+        self.addCleanup(bridge.stop)
+        transport = rbc.BridgeTransport({**config, "port": bridge.port})
+        self.addCleanup(transport.close)
+        return rbc.BridgeProxy(transport, "resolve", type_name="Resolve", shape="resolve"), transport
+
+    def test_input_reached_by_subscript(self) -> None:
+        tool, _ = self._serve(self.fake_tool)
+        tool["Size"].SetExpression("time/24", 0)
+        self.assertEqual(self.fake_input.expressions, [("time/24", 0)])
+
+    def test_keyframe_assignment_by_subscript(self) -> None:
+        tool, _ = self._serve(self.fake_tool)
+        tool["Size"][12] = 1.5
+        self.assertEqual(self.fake_input.keys, {12: 1.5})
+
+    def test_missing_key_reads_back_as_none(self) -> None:
+        tool, _ = self._serve(self.fake_tool)
+        self.assertIsNone(tool["NoSuchInput"])
+
+    def test_non_scalar_key_is_refused(self) -> None:
+        from src.utils import resolve_bridge_client as rbc
+
+        _, transport = self._serve(self.fake_tool)
+        with self.assertRaises(rbc.BridgeCallError) as ctx:
+            transport.request("get_item", {"target": "resolve", "key": ["Size"]})
+        self.assertEqual(ctx.exception.code, "invalid_arguments")
+
+    def test_bool_key_is_refused(self) -> None:
+        from src.utils import resolve_bridge_client as rbc
+
+        _, transport = self._serve(self.fake_tool)
+        for operation, arguments in (("get_item", {"key": True}),
+                                     ("set_item", {"key": False, "value": 1.0})):
+            with self.subTest(operation=operation):
+                with self.assertRaises(rbc.BridgeCallError) as ctx:
+                    transport.request(operation, {"target": "resolve", **arguments})
+                self.assertEqual(ctx.exception.code, "invalid_arguments")
+
+    def test_set_item_accepts_a_handle_value(self) -> None:
+        tool, _ = self._serve(self.fake_tool)
+        tool["Link"] = tool["Size"]
+        self.assertIs(self.fake_tool.assigned["Link"], self.fake_input)
+
+    def test_target_exception_maps_to_resolve_raised(self) -> None:
+        from src.utils import resolve_bridge_client as rbc
+
+        tool, _ = self._serve(self.fake_tool)
+        with self.assertRaises(rbc.BridgeCallError) as ctx:
+            tool["Boom"]
+        self.assertEqual(ctx.exception.code, "resolve_raised")
+
+    def test_a_proxy_is_still_not_iterable(self) -> None:
+        """`__getitem__` alone opts a class into the legacy sequence protocol.
+
+        `iter()` would then call get_item(0), get_item(1), ... until IndexError,
+        and a Fusion object answers None forever — an endless bridge loop where
+        there used to be a clean TypeError.
+        """
+        tool, _ = self._serve(self.fake_tool)
+        with self.assertRaises(TypeError):
+            iter(tool)
+        with self.assertRaises(TypeError):
+            "Size" in tool  # noqa: B015 - the membership test is the assertion
+
+    def test_subscript_on_old_bridge_names_the_fix(self) -> None:
+        from src.utils import resolve_bridge_ops as rbo
+
+        class OldOperations(rbo.ResolveOperations):
+            # OPERATIONS is concatenated once at class creation, so overriding
+            # only PROXY_OPERATIONS would not remove the routes.
+            PROXY_OPERATIONS = ("call", "release_handles", "list_methods", "get_attribute")
+            OPERATIONS = (rbo.ResolveOperations.READ_OPERATIONS + rbo.ResolveOperations.WRITE_OPERATIONS
+                          + PROXY_OPERATIONS + rbo.ResolveOperations.LIFECYCLE_OPERATIONS)
+
+        old_tool, _ = self._serve(self.fake_tool, operations=OldOperations)
+        with self.assertRaisesRegex(TypeError, "install_resolve_bridge.py.*reload"):
+            old_tool["Size"]
+        with self.assertRaisesRegex(TypeError, "install_resolve_bridge.py.*reload"):
+            old_tool["Size"] = 1.0
+
+
 class ServerReachesTheBridgeTests(unittest.TestCase):
     """The bridge has to be reachable on the machine it was built for.
 

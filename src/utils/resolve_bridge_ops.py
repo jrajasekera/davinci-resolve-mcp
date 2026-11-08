@@ -161,7 +161,7 @@ class ResolveOperations:
         "set_current_timeline",
     )
     #: The transparent proxy. See the module docstring for its security model.
-    PROXY_OPERATIONS = ("call", "release_handles", "list_methods", "get_attribute")
+    PROXY_OPERATIONS = ("call", "release_handles", "list_methods", "get_attribute", "get_item", "set_item")
     #: Lifecycle: they act on the bridge, never on the project. Separated from the
     #: write surface so "writes stay narrower than reads" keeps measuring what it
     #: was written to measure.
@@ -757,6 +757,52 @@ class ResolveOperations:
                             "from absent, because getattr never raises"}
         encoded = self._encoded(value, shape=f"{self._shape_of(arguments.get('target', 'resolve'))}.{name}")
         return {"kind": "value", **encoded}
+
+    # -- subscript ----------------------------------------------------------
+    #
+    # Fusion reaches its inputs by subscript: `tool["Size"]` is the Input, and
+    # `tool["Size"][time] = value` sets a keyframe. `call` cannot carry that,
+    # because it refuses every `_`-prefixed name — `__getitem__` included — and
+    # that refusal is what closes `__class__`/`__globals__` traversal, so it is
+    # not loosened. These two operations expose exactly one dunder each, with
+    # the key restricted to a JSON scalar, so nothing here names an attribute.
+
+    @staticmethod
+    def _subscript_key(arguments: Dict[str, Any]) -> Any:
+        if "key" not in arguments:
+            raise OperationError("invalid_arguments", "key is required")
+        key = arguments["key"]
+        # bool is an int subclass; `tool[True]` is a typo, not a frame number.
+        if isinstance(key, bool) or not isinstance(key, (str, int, float)):
+            raise OperationError("invalid_arguments", "key must be a string or a number")
+        return key
+
+    def op_get_item(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """`target[key]`, replying in the same shape as `call`.
+
+        The shape is `<target shape>[]` rather than the target's own: an Input
+        returned from a Tool must never share the Tool's cached method set, or
+        `tool["Size"].SetExpression` would be judged against the Tool's `dir()`.
+        """
+        key = self._subscript_key(arguments)
+        target_key = arguments.get("target", "resolve")
+        target = self._resolve_target(target_key)
+        try:
+            value = target[key]
+        except Exception as exc:  # noqa: BLE001 - a raising subscript is Resolve's answer
+            raise OperationError("resolve_raised", f"reading [{key!r}] raised: {str(exc)[:200]}")
+        return self._encoded(value, shape=f"{self._shape_of(target_key)}[]")
+
+    def op_set_item(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """`target[key] = value`. The value is decoded, so a handle arrives live."""
+        key = self._subscript_key(arguments)
+        target = self._resolve_target(arguments.get("target", "resolve"))
+        value = self._decode(arguments.get("value"))
+        try:
+            target[key] = value
+        except Exception as exc:  # noqa: BLE001 - a raising assignment is Resolve's answer
+            raise OperationError("resolve_raised", f"assigning [{key!r}] raised: {str(exc)[:200]}")
+        return {"value": None}
 
     def op_release_handles(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Drop handles a client no longer needs, or all of them."""
